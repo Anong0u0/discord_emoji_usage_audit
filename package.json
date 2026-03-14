@@ -1,0 +1,12 @@
+{
+  "name": "discord-emoji-usage-audit",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node emoji-usage-audit.js"
+  },
+  "dependencies": {
+    "@discordjs/rest": "^2.6.0",
+    "dotenv": "^16.5.0"
+  }
+}
