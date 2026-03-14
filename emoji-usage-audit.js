@@ -1,55 +1,488 @@
-import 'dotenv/config';
+#!/usr/bin/env node
+import dotenv from 'dotenv';
 import { REST, RESTEvents } from '@discordjs/rest';
-import { mkdir, writeFile } from 'node:fs/promises';
+import { access, mkdir, readFile, writeFile } from 'node:fs/promises';
+import { constants as fsConstants } from 'node:fs';
+import path from 'node:path';
 import process from 'node:process';
+import { parse as parseYaml } from 'yaml';
 
-const CONFIG = {
-  token: process.env.DISCORD_BOT_TOKEN ?? '',
-  guildId: process.env.DISCORD_GUILD_ID ?? '',
+dotenv.config();
 
-  // API / runtime
-  apiVersion: '9',
+const CLI_VERSION = '1.0.0';
+const DEFAULT_CONFIG_FILENAME = 'emoji-audit.yml';
+
+const DEFAULT_CONFIG = {
+  guildId: '',
   concurrency: 4,
-  maxRequestRetries: 6,
-  retryBaseMs: 750,
-  indexRetryCapMs: 15_000,
-  logRateLimits: true,
-  maxEmojis: null, // null = audit all filtered emojis
-
-  // Emoji filters (null = no filter)
-  filterAnimated: null,   // true => only animated, false => only static
-  filterAvailable: null,  // true => only available, false => only unavailable
-  filterManaged: null,    // true => only managed, false => only unmanaged
-
-  // Optional allow/deny lists
-  onlyEmojiNames: null,   // e.g. ['laugh', 'cry']
-  skipEmojiNames: [],
-
-  // Output
-  outputDir: './out',
-  outputCsvName: 'emoji-usage-report.csv',
-  outputJsonName: 'emoji-usage-report.json',
-
-  // CSV content
-  excerptLength: 120,
+  maxEmojis: null,
+  runtime: {
+    apiVersion: '9',
+    maxRequestRetries: 6,
+    retryBaseMs: 750,
+    indexRetryCapMs: 15_000,
+    logRateLimits: true,
+  },
+  filters: {
+    animated: null,
+    available: null,
+    managed: null,
+    onlyEmojiNames: [],
+    skipEmojiNames: [],
+  },
+  output: {
+    dir: './emoji-usage-output',
+  },
+  format: {
+    excerptLength: 120,
+  },
 };
 
-const rest = new REST({ version: CONFIG.apiVersion }).setToken(CONFIG.token);
+const HELP_TEXT = `Discord Emoji Usage Audit
 
-rest.on(RESTEvents.RateLimited, (info) => {
-  if (!CONFIG.logRateLimits) return;
-  console.warn(
-    `[rate-limit] scope=${info.scope} global=${info.global} method=${info.method} route=${info.route} retryAfterMs=${info.retryAfter}`,
-  );
-});
+Usage:
+  emoji-audit [options]
+  node emoji-usage-audit.js [options]
 
-function assertConfig() {
-  const missing = [];
-  if (!CONFIG.token) missing.push('DISCORD_BOT_TOKEN');
-  if (!CONFIG.guildId) missing.push('DISCORD_GUILD_ID');
+Default config:
+  The CLI will try to read ./${DEFAULT_CONFIG_FILENAME} (default path)
+  If that default file does not exist, execution continues without error.
+  If --config or EMOJI_AUDIT_CONFIG points to a missing file, execution fails.
 
-  if (missing.length > 0) {
-    throw new Error(`Missing required environment variables: ${missing.join(', ')}`);
+Environment:
+  DISCORD_BOT_TOKEN          Required bot token (default: none)
+  EMOJI_AUDIT_CONFIG         Optional config file path (default: unset)
+
+Options:
+  --config <path>            Load a specific YAML config file (default: ./${DEFAULT_CONFIG_FILENAME})
+  --guild-id <id>            Override guildId from config (default: config value)
+  --output-dir <path>        Override output.dir (default: ${DEFAULT_CONFIG.output.dir})
+  --concurrency <n>          Override concurrency (default: ${DEFAULT_CONFIG.concurrency})
+  --max-emojis <n|null>      Override maxEmojis (default: ${DEFAULT_CONFIG.maxEmojis})
+  --only <a,b,c>             Override filters.onlyEmojiNames (default: empty)
+  --skip <a,b,c>             Override filters.skipEmojiNames (default: empty)
+  --animated <true|false>    Set filters.animated (default: null)
+  --available <true|false>   Set filters.available (default: null)
+  --managed <true|false>     Set filters.managed (default: null)
+  --excerpt-length <n>       Override format.excerptLength (default: ${DEFAULT_CONFIG.format.excerptLength})
+  --log-rate-limits <true|false>
+                             Set runtime.logRateLimits (default: ${DEFAULT_CONFIG.runtime.logRateLimits})
+  Output files are always named report-yymmdd-hhmmss.csv/json.
+  --help                     Show this help text
+  --version                  Show CLI version
+`;
+
+let CONFIG = null;
+let rest = null;
+
+function printHelp() {
+  console.log(HELP_TEXT);
+}
+
+function printVersion() {
+  console.log(CLI_VERSION);
+}
+
+function isPlainObject(value) {
+  return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
+}
+
+function deepMerge(base, override) {
+  if (Array.isArray(override)) {
+    return [...override];
+  }
+
+  if (!isPlainObject(override)) {
+    return override;
+  }
+
+  const baseObject = isPlainObject(base) ? base : {};
+  const result = { ...baseObject };
+
+  for (const [key, value] of Object.entries(override)) {
+    if (Array.isArray(value)) {
+      result[key] = [...value];
+      continue;
+    }
+
+    if (isPlainObject(value)) {
+      result[key] = deepMerge(baseObject[key], value);
+      continue;
+    }
+
+    result[key] = value;
+  }
+
+  return result;
+}
+
+function setNestedValue(target, pathSegments, value) {
+  let current = target;
+
+  for (let index = 0; index < pathSegments.length - 1; index += 1) {
+    const segment = pathSegments[index];
+    if (!isPlainObject(current[segment])) {
+      current[segment] = {};
+    }
+    current = current[segment];
+  }
+
+  current[pathSegments[pathSegments.length - 1]] = value;
+}
+
+function parseListFlag(value) {
+  if (value.trim() === '') return [];
+  return value
+    .split(',')
+    .map((item) => item.trim())
+    .filter(Boolean);
+}
+
+function parseIntegerFlag(name, value, { allowNull = false, min = 0 } = {}) {
+  if (allowNull && ['null', 'none', 'all'].includes(value.toLowerCase())) {
+    return null;
+  }
+
+  const parsed = Number.parseInt(value, 10);
+  if (!Number.isFinite(parsed) || String(parsed) !== value.trim()) {
+    throw new Error(`Invalid value for ${name}: ${value}`);
+  }
+  if (parsed < min) {
+    throw new Error(`${name} must be >= ${min}`);
+  }
+  return parsed;
+}
+
+function parseBooleanFlag(name, value) {
+  if (value === 'true') return true;
+  if (value === 'false') return false;
+  throw new Error(`Invalid value for ${name}: ${value}. Expected true or false.`);
+}
+
+function consumeFlagValue(args, index, flagName) {
+  const current = args[index];
+  const equalSignIndex = current.indexOf('=');
+  if (equalSignIndex >= 0) {
+    return {
+      value: current.slice(equalSignIndex + 1),
+      nextIndex: index,
+    };
+  }
+
+  const next = args[index + 1];
+  if (next === undefined || next.startsWith('--')) {
+    throw new Error(`Missing value for ${flagName}`);
+  }
+
+  return {
+    value: next,
+    nextIndex: index + 1,
+  };
+}
+
+function parseCliArgs(argv) {
+  const overrides = {};
+  let configPath = null;
+  let showHelp = false;
+  let showVersion = false;
+
+  for (let index = 0; index < argv.length; index += 1) {
+    const arg = argv[index];
+
+    if (!arg.startsWith('--')) {
+      throw new Error(`Unknown positional argument: ${arg}`);
+    }
+
+    switch (arg.split('=')[0]) {
+      case '--help':
+        showHelp = true;
+        break;
+      case '--version':
+        showVersion = true;
+        break;
+      case '--config': {
+        const consumed = consumeFlagValue(argv, index, '--config');
+        configPath = consumed.value;
+        index = consumed.nextIndex;
+        break;
+      }
+      case '--guild-id': {
+        const consumed = consumeFlagValue(argv, index, '--guild-id');
+        setNestedValue(overrides, ['guildId'], consumed.value);
+        index = consumed.nextIndex;
+        break;
+      }
+      case '--output-dir': {
+        const consumed = consumeFlagValue(argv, index, '--output-dir');
+        setNestedValue(overrides, ['output', 'dir'], consumed.value);
+        index = consumed.nextIndex;
+        break;
+      }
+      case '--concurrency': {
+        const consumed = consumeFlagValue(argv, index, '--concurrency');
+        setNestedValue(
+          overrides,
+          ['concurrency'],
+          parseIntegerFlag('--concurrency', consumed.value, { min: 1 }),
+        );
+        index = consumed.nextIndex;
+        break;
+      }
+      case '--max-emojis': {
+        const consumed = consumeFlagValue(argv, index, '--max-emojis');
+        setNestedValue(
+          overrides,
+          ['maxEmojis'],
+          parseIntegerFlag('--max-emojis', consumed.value, { allowNull: true, min: 0 }),
+        );
+        index = consumed.nextIndex;
+        break;
+      }
+      case '--only': {
+        const consumed = consumeFlagValue(argv, index, '--only');
+        setNestedValue(overrides, ['filters', 'onlyEmojiNames'], parseListFlag(consumed.value));
+        index = consumed.nextIndex;
+        break;
+      }
+      case '--skip': {
+        const consumed = consumeFlagValue(argv, index, '--skip');
+        setNestedValue(overrides, ['filters', 'skipEmojiNames'], parseListFlag(consumed.value));
+        index = consumed.nextIndex;
+        break;
+      }
+      case '--animated': {
+        const consumed = consumeFlagValue(argv, index, '--animated');
+        setNestedValue(overrides, ['filters', 'animated'], parseBooleanFlag('--animated', consumed.value));
+        index = consumed.nextIndex;
+        break;
+      }
+      case '--available': {
+        const consumed = consumeFlagValue(argv, index, '--available');
+        setNestedValue(overrides, ['filters', 'available'], parseBooleanFlag('--available', consumed.value));
+        index = consumed.nextIndex;
+        break;
+      }
+      case '--managed': {
+        const consumed = consumeFlagValue(argv, index, '--managed');
+        setNestedValue(overrides, ['filters', 'managed'], parseBooleanFlag('--managed', consumed.value));
+        index = consumed.nextIndex;
+        break;
+      }
+      case '--excerpt-length': {
+        const consumed = consumeFlagValue(argv, index, '--excerpt-length');
+        setNestedValue(
+          overrides,
+          ['format', 'excerptLength'],
+          parseIntegerFlag('--excerpt-length', consumed.value, { min: 0 }),
+        );
+        index = consumed.nextIndex;
+        break;
+      }
+      case '--log-rate-limits': {
+        const consumed = consumeFlagValue(argv, index, '--log-rate-limits');
+        setNestedValue(overrides, ['runtime', 'logRateLimits'], parseBooleanFlag('--log-rate-limits', consumed.value));
+        index = consumed.nextIndex;
+        break;
+      }
+      default:
+        throw new Error(`Unknown option: ${arg}`);
+    }
+  }
+
+  return {
+    configPath,
+    overrides,
+    showHelp,
+    showVersion,
+  };
+}
+
+async function pathExists(filePath) {
+  try {
+    await access(filePath, fsConstants.F_OK);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function resolveConfigPath(cliConfigPath, envConfigPath) {
+  if (cliConfigPath) {
+    return {
+      path: path.resolve(process.cwd(), cliConfigPath),
+      explicit: true,
+      source: '--config',
+    };
+  }
+
+  if (envConfigPath) {
+    return {
+      path: path.resolve(process.cwd(), envConfigPath),
+      explicit: true,
+      source: 'EMOJI_AUDIT_CONFIG',
+    };
+  }
+
+  return {
+    path: path.resolve(process.cwd(), DEFAULT_CONFIG_FILENAME),
+    explicit: false,
+    source: 'default',
+  };
+}
+
+async function loadConfigFile(configLocation) {
+  const exists = await pathExists(configLocation.path);
+
+  if (!exists) {
+    if (configLocation.explicit) {
+      throw new Error(`Config file not found: ${configLocation.path}`);
+    }
+    return {};
+  }
+
+  const text = await readFile(configLocation.path, 'utf8');
+
+  let parsed;
+  try {
+    parsed = parseYaml(text);
+  } catch (error) {
+    throw new Error(`Failed to parse config file ${configLocation.path}: ${error.message}`);
+  }
+
+  if (parsed === null || parsed === undefined) {
+    return {};
+  }
+
+  if (!isPlainObject(parsed)) {
+    throw new Error(`Config file ${configLocation.path} must contain a top-level mapping`);
+  }
+
+  return parsed;
+}
+
+function normalizeOptionalString(value, fieldName) {
+  if (value === null || value === undefined) return '';
+  if (typeof value !== 'string') {
+    throw new Error(`${fieldName} must be a string`);
+  }
+  return value.trim();
+}
+
+function normalizeString(value, fieldName) {
+  if (typeof value !== 'string' || value.trim() === '') {
+    throw new Error(`${fieldName} must be a non-empty string`);
+  }
+  return value.trim();
+}
+
+function normalizeBooleanOrNull(value, fieldName) {
+  if (value === null) return null;
+  if (typeof value !== 'boolean') {
+    throw new Error(`${fieldName} must be true, false, or null`);
+  }
+  return value;
+}
+
+function normalizeIntegerOrNull(value, fieldName, { min = 0, allowNull = true } = {}) {
+  if (value === null || value === undefined) {
+    if (allowNull) return null;
+    throw new Error(`${fieldName} is required`);
+  }
+
+  if (!Number.isInteger(value) || value < min) {
+    throw new Error(`${fieldName} must be an integer >= ${min}`);
+  }
+
+  return value;
+}
+
+function normalizeInteger(value, fieldName, { min = 0 } = {}) {
+  if (!Number.isInteger(value) || value < min) {
+    throw new Error(`${fieldName} must be an integer >= ${min}`);
+  }
+  return value;
+}
+
+function normalizeStringArray(value, fieldName) {
+  if (value === null) return null;
+  if (!Array.isArray(value)) {
+    throw new Error(`${fieldName} must be an array of strings or null`);
+  }
+
+  return value.map((item, index) => {
+    if (typeof item !== 'string') {
+      throw new Error(`${fieldName}[${index}] must be a string`);
+    }
+    return item.trim();
+  });
+}
+
+function buildRuntimeConfig(mergedConfig, envConfig) {
+  return {
+    token: normalizeOptionalString(envConfig.token, 'DISCORD_BOT_TOKEN'),
+    guildId: normalizeOptionalString(mergedConfig.guildId, 'guildId'),
+    apiVersion: normalizeString(mergedConfig.runtime.apiVersion, 'runtime.apiVersion'),
+    concurrency: normalizeInteger(mergedConfig.concurrency, 'concurrency', { min: 1 }),
+    maxRequestRetries: normalizeInteger(mergedConfig.runtime.maxRequestRetries, 'runtime.maxRequestRetries', { min: 0 }),
+    retryBaseMs: normalizeInteger(mergedConfig.runtime.retryBaseMs, 'runtime.retryBaseMs', { min: 0 }),
+    indexRetryCapMs: normalizeInteger(mergedConfig.runtime.indexRetryCapMs, 'runtime.indexRetryCapMs', { min: 0 }),
+    logRateLimits: normalizeBooleanOrNull(mergedConfig.runtime.logRateLimits, 'runtime.logRateLimits') ?? true,
+    maxEmojis: normalizeIntegerOrNull(mergedConfig.maxEmojis, 'maxEmojis', { min: 0, allowNull: true }),
+    filterAnimated: normalizeBooleanOrNull(mergedConfig.filters.animated, 'filters.animated'),
+    filterAvailable: normalizeBooleanOrNull(mergedConfig.filters.available, 'filters.available'),
+    filterManaged: normalizeBooleanOrNull(mergedConfig.filters.managed, 'filters.managed'),
+    onlyEmojiNames: normalizeStringArray(mergedConfig.filters.onlyEmojiNames, 'filters.onlyEmojiNames'),
+    skipEmojiNames: normalizeStringArray(mergedConfig.filters.skipEmojiNames, 'filters.skipEmojiNames') ?? [],
+    outputDir: normalizeString(mergedConfig.output.dir, 'output.dir'),
+    excerptLength: normalizeInteger(mergedConfig.format.excerptLength, 'format.excerptLength', { min: 0 }),
+  };
+}
+
+async function loadRuntimeConfig(argv) {
+  const cli = parseCliArgs(argv);
+
+  if (cli.showHelp) {
+    printHelp();
+    process.exit(0);
+  }
+
+  if (cli.showVersion) {
+    printVersion();
+    process.exit(0);
+  }
+
+  const envConfig = {
+    token: process.env.DISCORD_BOT_TOKEN ?? '',
+    configPath: process.env.EMOJI_AUDIT_CONFIG ?? '',
+  };
+
+  const configLocation = resolveConfigPath(cli.configPath, envConfig.configPath);
+  const fileConfig = await loadConfigFile(configLocation);
+  const mergedConfig = deepMerge(deepMerge(DEFAULT_CONFIG, fileConfig), cli.overrides);
+
+  return buildRuntimeConfig(mergedConfig, envConfig);
+}
+
+function createRestClient(config) {
+  const client = new REST({ version: config.apiVersion }).setToken(config.token);
+
+  client.on(RESTEvents.RateLimited, (info) => {
+    if (!config.logRateLimits) return;
+    console.warn(
+      `[rate-limit] scope=${info.scope} global=${info.global} method=${info.method} route=${info.route} retryAfterMs=${info.retryAfter}`,
+    );
+  });
+
+  return client;
+}
+
+function assertConfig(config) {
+  if (!config.token) {
+    throw new Error('Missing required bot token. Set DISCORD_BOT_TOKEN in the environment.');
+  }
+
+  if (!config.guildId) {
+    throw new Error(`Missing guildId. Set it in ${DEFAULT_CONFIG_FILENAME} or pass --guild-id.`);
   }
 }
 
@@ -85,7 +518,7 @@ function excerpt(text, maxLength = CONFIG.excerptLength) {
   if (!text) return '';
   const normalized = String(text).replace(/\s+/g, ' ').trim();
   if (normalized.length <= maxLength) return normalized;
-  return `${normalized.slice(0, maxLength - 1)}…`;
+  return `${normalized.slice(0, maxLength - 1)}...`;
 }
 
 function daysBetween(earlier, later = now()) {
@@ -151,11 +584,6 @@ function findLatestMatchingMessage(messages, emoji) {
 function summarizeMessage(message) {
   if (!message) {
     return {
-      messageId: '',
-      channelId: '',
-      authorId: '',
-      authorUsername: '',
-      authorGlobalName: '',
       timestamp: '',
       contentExcerpt: '',
       url: '',
@@ -163,11 +591,6 @@ function summarizeMessage(message) {
   }
 
   return {
-    messageId: String(message.id ?? ''),
-    channelId: String(message.channel_id ?? ''),
-    authorId: String(message.author?.id ?? ''),
-    authorUsername: String(message.author?.username ?? ''),
-    authorGlobalName: String(message.author?.global_name ?? ''),
     timestamp: toIso(message.timestamp),
     contentExcerpt: excerpt(message.content ?? ''),
     url: buildMessageUrl(CONFIG.guildId, message.channel_id, message.id),
@@ -237,7 +660,9 @@ async function getGuildEmojis(guildId) {
 }
 
 function filterEmojis(emojis) {
-  const onlySet = CONFIG.onlyEmojiNames ? new Set(CONFIG.onlyEmojiNames) : null;
+  const onlySet = Array.isArray(CONFIG.onlyEmojiNames) && CONFIG.onlyEmojiNames.length > 0
+    ? new Set(CONFIG.onlyEmojiNames)
+    : null;
   const skipSet = new Set(CONFIG.skipEmojiNames ?? []);
 
   return emojis.filter((emoji) => {
@@ -273,7 +698,7 @@ async function auditEmoji(emoji) {
     ? Number(((totalResults / daysSinceEmojiCreation) * 30).toFixed(3))
     : 0;
 
-  const row = {
+  return {
     emoji_id: String(emoji.id),
     emoji_name: String(emoji.name),
     emoji_query: buildEmojiSearchKeyword(emoji),
@@ -289,8 +714,6 @@ async function auditEmoji(emoji) {
     latest_message_url: latest.url,
     latest_content_excerpt: latest.contentExcerpt,
   };
-
-  return row;
 }
 
 async function mapConcurrent(items, concurrency, mapper) {
@@ -327,6 +750,20 @@ function limitItems(items, maxItems) {
   const limit = Number(maxItems);
   if (!Number.isFinite(limit) || limit < 0) return items;
   return items.slice(0, limit);
+}
+
+function pad2(value) {
+  return String(value).padStart(2, '0');
+}
+
+function buildReportBasename(date = new Date()) {
+  const year = String(date.getFullYear()).slice(-2);
+  const month = pad2(date.getMonth() + 1);
+  const day = pad2(date.getDate());
+  const hour = pad2(date.getHours());
+  const minute = pad2(date.getMinutes());
+  const second = pad2(date.getSeconds());
+  return `report-${year}${month}${day}-${hour}${minute}${second}`;
 }
 
 async function writeCsv(rows, filePath) {
@@ -369,7 +806,9 @@ function summarizeRun(rows) {
 }
 
 async function main() {
-  assertConfig();
+  CONFIG = await loadRuntimeConfig(process.argv.slice(2));
+  assertConfig(CONFIG);
+  rest = createRestClient(CONFIG);
 
   console.log(`Fetching emojis for guild ${CONFIG.guildId}...`);
   const emojis = await getGuildEmojis(CONFIG.guildId);
@@ -389,8 +828,9 @@ async function main() {
   const sortedRows = sortRows(rows);
 
   await mkdir(CONFIG.outputDir, { recursive: true });
-  const csvPath = `${CONFIG.outputDir}/${CONFIG.outputCsvName}`;
-  const jsonPath = `${CONFIG.outputDir}/${CONFIG.outputJsonName}`;
+  const reportBasename = buildReportBasename();
+  const csvPath = path.join(CONFIG.outputDir, `${reportBasename}.csv`);
+  const jsonPath = path.join(CONFIG.outputDir, `${reportBasename}.json`);
 
   await writeCsv(sortedRows, csvPath);
   await writeJson(sortedRows, jsonPath);
@@ -406,6 +846,6 @@ async function main() {
 
 main().catch((error) => {
   console.error('Fatal error');
-  console.error(error);
+  console.error(error.message ?? error);
   process.exitCode = 1;
 });

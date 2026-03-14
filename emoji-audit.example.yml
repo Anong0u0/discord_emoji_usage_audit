@@ -1,0 +1,67 @@
+# Required.
+# Discord guild/server ID to audit.
+guildId: "YOUR_GUILD_ID"
+
+# Number of concurrent search requests.
+# Default: 4
+concurrency: 4
+
+# Limit how many filtered emojis to audit.
+# Use null to audit all matching emojis.
+# Default: null
+maxEmojis: null
+
+runtime:
+  # Discord REST API version.
+  # Default: "9"
+  apiVersion: "9"
+
+  # Retry count for transient HTTP failures.
+  # Default: 6
+  maxRequestRetries: 6
+
+  # Base retry delay in milliseconds.
+  # Default: 750
+  retryBaseMs: 750
+
+  # Max wait for Discord indexing retry in milliseconds.
+  # Default: 15000
+  indexRetryCapMs: 15000
+
+  # Enable Discord rate-limit log output.
+  # Default: true
+  logRateLimits: true
+
+filters:
+  # true  = only animated emojis
+  # false = only static emojis
+  # null  = no filter
+  animated: null
+
+  # true  = only available emojis
+  # false = only unavailable emojis
+  # null  = no filter
+  available: null
+
+  # true  = only managed emojis
+  # false = only unmanaged emojis
+  # null  = no filter
+  managed: null
+
+  # Audit only these emoji names.
+  # Empty array means no allowlist.
+  onlyEmojiNames: []
+
+  # Skip these emoji names.
+  # Empty array means do not skip any names.
+  skipEmojiNames: []
+
+output:
+  # Output directory for generated files.
+  # Default: "./emoji-usage-output"
+  dir: "./emoji-usage-output"
+
+format:
+  # Max characters kept for latest message excerpt.
+  # Default: 120
+  excerptLength: 120
