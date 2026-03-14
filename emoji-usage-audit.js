@@ -47,11 +47,9 @@ Usage:
 Default config:
   The CLI will try to read ./${DEFAULT_CONFIG_FILENAME} (default path)
   If that default file does not exist, execution continues without error.
-  If --config or EMOJI_AUDIT_CONFIG points to a missing file, execution fails.
 
 Environment:
-  DISCORD_BOT_TOKEN          Required bot token (default: none)
-  EMOJI_AUDIT_CONFIG         Optional config file path (default: unset)
+  DISCORD_BOT_TOKEN          Required bot token
 
 Options:
   --config <path>            Load a specific YAML config file (default: ./${DEFAULT_CONFIG_FILENAME})
@@ -71,9 +69,6 @@ Options:
   --help                     Show this help text
   --version                  Show CLI version
 `;
-
-let CONFIG = null;
-let rest = null;
 
 function printHelp() {
   console.log(HELP_TEXT);
@@ -306,20 +301,12 @@ async function pathExists(filePath) {
   }
 }
 
-function resolveConfigPath(cliConfigPath, envConfigPath) {
+function resolveConfigPath(cliConfigPath) {
   if (cliConfigPath) {
     return {
       path: path.resolve(process.cwd(), cliConfigPath),
       explicit: true,
       source: '--config',
-    };
-  }
-
-  if (envConfigPath) {
-    return {
-      path: path.resolve(process.cwd(), envConfigPath),
-      explicit: true,
-      source: 'EMOJI_AUDIT_CONFIG',
     };
   }
 
@@ -453,10 +440,9 @@ async function loadRuntimeConfig(argv) {
 
   const envConfig = {
     token: process.env.DISCORD_BOT_TOKEN ?? '',
-    configPath: process.env.EMOJI_AUDIT_CONFIG ?? '',
   };
 
-  const configLocation = resolveConfigPath(cli.configPath, envConfig.configPath);
+  const configLocation = resolveConfigPath(cli.configPath);
   const fileConfig = await loadConfigFile(configLocation);
   const mergedConfig = deepMerge(deepMerge(DEFAULT_CONFIG, fileConfig), cli.overrides);
 
@@ -514,7 +500,7 @@ function toCsvValue(value) {
   return text;
 }
 
-function excerpt(text, maxLength = CONFIG.excerptLength) {
+function excerpt(text, maxLength) {
   if (!text) return '';
   const normalized = String(text).replace(/\s+/g, ' ').trim();
   if (normalized.length <= maxLength) return normalized;
@@ -545,14 +531,14 @@ function buildEmojiSearchKeyword(emoji) {
   return `<${animatedPrefix}:${emoji.name}:${emoji.id}>`;
 }
 
-function buildLatestSearchRoute(emoji) {
+function buildLatestSearchRoute(guildId, emoji) {
   const params = new URLSearchParams({
     content: buildEmojiSearchKeyword(emoji),
     sort_by: 'timestamp',
     sort_order: 'desc',
     offset: '0',
   });
-  return `/guilds/${CONFIG.guildId}/messages/search?${params.toString()}`;
+  return `/guilds/${guildId}/messages/search?${params.toString()}`;
 }
 
 function escapeRegex(value) {
@@ -581,7 +567,7 @@ function findLatestMatchingMessage(messages, emoji) {
   return null;
 }
 
-function summarizeMessage(message) {
+function summarizeMessage(message, config) {
   if (!message) {
     return {
       timestamp: '',
@@ -592,8 +578,8 @@ function summarizeMessage(message) {
 
   return {
     timestamp: toIso(message.timestamp),
-    contentExcerpt: excerpt(message.content ?? ''),
-    url: buildMessageUrl(CONFIG.guildId, message.channel_id, message.id),
+    contentExcerpt: excerpt(message.content ?? '', config.excerptLength),
+    url: buildMessageUrl(config.guildId, message.channel_id, message.id),
   };
 }
 
@@ -609,7 +595,23 @@ function normalizeDiscordError(error) {
   };
 }
 
-async function apiGet(route) {
+function filterEmojis(emojis, config) {
+  const onlySet = Array.isArray(config.onlyEmojiNames) && config.onlyEmojiNames.length > 0
+    ? new Set(config.onlyEmojiNames)
+    : null;
+  const skipSet = new Set(config.skipEmojiNames ?? []);
+
+  return emojis.filter((emoji) => {
+    if (config.filterAnimated !== null && Boolean(emoji.animated) !== config.filterAnimated) return false;
+    if (config.filterAvailable !== null && Boolean(emoji.available) !== config.filterAvailable) return false;
+    if (config.filterManaged !== null && Boolean(emoji.managed) !== config.filterManaged) return false;
+    if (onlySet && !onlySet.has(emoji.name)) return false;
+    if (skipSet.has(emoji.name)) return false;
+    return true;
+  });
+}
+
+async function apiGet(rest, config, route) {
   let attempt = 0;
 
   while (true) {
@@ -625,7 +627,7 @@ async function apiGet(route) {
         const retryAfterSeconds = Number(result.retry_after ?? 0);
         const waitMs = Math.min(
           Math.max(250, Math.ceil(retryAfterSeconds * 1000) + Math.floor(Math.random() * 250)),
-          CONFIG.indexRetryCapMs,
+          config.indexRetryCapMs,
         );
         console.warn(`[indexing] ${route} not ready yet; retrying in ${waitMs}ms`);
         await sleep(waitMs);
@@ -636,13 +638,14 @@ async function apiGet(route) {
     } catch (error) {
       const normalized = normalizeDiscordError(error);
       const status = Number(normalized?.status ?? 0);
-      const retriable = [500, 502, 503, 504].includes(status) || /ECONNRESET|ETIMEDOUT|fetch failed/i.test(String(error?.message ?? ''));
+      const retriable = [500, 502, 503, 504].includes(status)
+        || /ECONNRESET|ETIMEDOUT|fetch failed/i.test(String(error?.message ?? ''));
 
-      if (!retriable || attempt >= CONFIG.maxRequestRetries) {
+      if (!retriable || attempt >= config.maxRequestRetries) {
         throw error;
       }
 
-      const waitMs = CONFIG.retryBaseMs * (2 ** attempt) + Math.floor(Math.random() * 250);
+      const waitMs = config.retryBaseMs * (2 ** attempt) + Math.floor(Math.random() * 250);
       console.warn(`[retry] ${route} failed with status=${status || 'unknown'}; retrying in ${waitMs}ms`);
       attempt += 1;
       await sleep(waitMs);
@@ -650,33 +653,17 @@ async function apiGet(route) {
   }
 }
 
-async function getGuildEmojis(guildId) {
+async function getGuildEmojis(rest, config, guildId) {
   const route = `/guilds/${guildId}/emojis`;
-  const result = await apiGet(route);
+  const result = await apiGet(rest, config, route);
   if (!Array.isArray(result)) {
     throw new Error(`Unexpected emoji response shape from ${route}`);
   }
   return result;
 }
 
-function filterEmojis(emojis) {
-  const onlySet = Array.isArray(CONFIG.onlyEmojiNames) && CONFIG.onlyEmojiNames.length > 0
-    ? new Set(CONFIG.onlyEmojiNames)
-    : null;
-  const skipSet = new Set(CONFIG.skipEmojiNames ?? []);
-
-  return emojis.filter((emoji) => {
-    if (CONFIG.filterAnimated !== null && Boolean(emoji.animated) !== CONFIG.filterAnimated) return false;
-    if (CONFIG.filterAvailable !== null && Boolean(emoji.available) !== CONFIG.filterAvailable) return false;
-    if (CONFIG.filterManaged !== null && Boolean(emoji.managed) !== CONFIG.filterManaged) return false;
-    if (onlySet && !onlySet.has(emoji.name)) return false;
-    if (skipSet.has(emoji.name)) return false;
-    return true;
-  });
-}
-
-async function searchEmojiLatest(emoji) {
-  return apiGet(buildLatestSearchRoute(emoji));
+function searchEmojiLatest(rest, config, emoji) {
+  return apiGet(rest, config, buildLatestSearchRoute(config.guildId, emoji));
 }
 
 function numberOrZero(value) {
@@ -684,18 +671,17 @@ function numberOrZero(value) {
   return Number.isFinite(n) ? n : 0;
 }
 
-async function auditEmoji(emoji) {
+async function auditEmoji(rest, config, emoji) {
   const createdAt = snowflakeToDate(emoji.id);
-  const latestResponse = await searchEmojiLatest(emoji);
+  const latestResponse = await searchEmojiLatest(rest, config, emoji);
   const latestMessage = findLatestMatchingMessage(latestResponse.messages, emoji);
   const totalResults = latestMessage ? numberOrZero(latestResponse.total_results) : 0;
-  const latest = summarizeMessage(latestMessage);
+  const latest = summarizeMessage(latestMessage, config);
   const lastUseDate = latest.timestamp || '';
   const emojiAgeDays = daysBetween(createdAt);
   const lastUseAgeDays = daysBetween(lastUseDate);
-  const daysSinceEmojiCreation = daysBetween(createdAt);
-  const usesPer30dSinceCreation = daysSinceEmojiCreation && daysSinceEmojiCreation > 0
-    ? Number(((totalResults / daysSinceEmojiCreation) * 30).toFixed(3))
+  const usesPer30dSinceCreation = emojiAgeDays && emojiAgeDays > 0
+    ? Number(((totalResults / emojiAgeDays) * 30).toFixed(3))
     : 0;
 
   return {
@@ -806,42 +792,40 @@ function summarizeRun(rows) {
 }
 
 async function main() {
-  CONFIG = await loadRuntimeConfig(process.argv.slice(2));
-  assertConfig(CONFIG);
-  rest = createRestClient(CONFIG);
+  const config = await loadRuntimeConfig(process.argv.slice(2));
+  assertConfig(config);
+  const rest = createRestClient(config);
 
-  console.log(`Fetching emojis for guild ${CONFIG.guildId}...`);
-  const emojis = await getGuildEmojis(CONFIG.guildId);
-  const filteredEmojis = limitItems(filterEmojis(emojis), CONFIG.maxEmojis);
+  console.log(`Fetching emojis for guild ${config.guildId}...`);
+  const emojis = await getGuildEmojis(rest, config, config.guildId);
+  const filteredEmojis = limitItems(filterEmojis(emojis, config), config.maxEmojis);
   console.log(`Fetched ${emojis.length} emoji(s); auditing ${filteredEmojis.length} after filters.`);
 
   const startedAt = Date.now();
-  const rows = await mapConcurrent(filteredEmojis, CONFIG.concurrency, async (emoji, index) => {
-    const row = await auditEmoji(emoji);
-    const processed = index + 1;
+  let completed = 0;
+  const rows = await mapConcurrent(filteredEmojis, config.concurrency, async (emoji) => {
+    const row = await auditEmoji(rest, config, emoji);
+    completed += 1;
     console.log(
-      `[${processed}/${filteredEmojis.length}] ${emoji.name} -> total=${row.total_results} lastUsed=${row.last_used_at || 'never'}`,
+      `[${completed}/${filteredEmojis.length}] ${emoji.name} -> total=${row.total_results} lastUsed=${row.last_used_at || 'never'}`,
     );
     return row;
   });
 
   const sortedRows = sortRows(rows);
-
-  await mkdir(CONFIG.outputDir, { recursive: true });
+  await mkdir(config.outputDir, { recursive: true });
   const reportBasename = buildReportBasename();
-  const csvPath = path.join(CONFIG.outputDir, `${reportBasename}.csv`);
-  const jsonPath = path.join(CONFIG.outputDir, `${reportBasename}.json`);
+  const csvPath = path.join(config.outputDir, `${reportBasename}.csv`);
+  const jsonPath = path.join(config.outputDir, `${reportBasename}.json`);
 
   await writeCsv(sortedRows, csvPath);
   await writeJson(sortedRows, jsonPath);
-
   summarizeRun(sortedRows);
 
-  const elapsedMs = Date.now() - startedAt;
   console.log('');
   console.log(`CSV written to: ${csvPath}`);
   console.log(`JSON written to: ${jsonPath}`);
-  console.log(`Elapsed: ${(elapsedMs / 1000).toFixed(1)}s`);
+  console.log(`Elapsed: ${((Date.now() - startedAt) / 1000).toFixed(1)}s`);
 }
 
 main().catch((error) => {

@@ -1,11 +1,11 @@
-node_modules/
+node_modules/*
 
 .env
 .env.local
 .env.*.local
 emoji-audit.yml
 
-out/
+output/*
 
 *.log
 npm-debug.log*
