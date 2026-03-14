@@ -4,9 +4,6 @@ import { mkdir, writeFile } from 'node:fs/promises';
 import process from 'node:process';
 
 const CONFIG = {
-  // Required environment variables:
-  //   DISCORD_BOT_TOKEN=...
-  //   DISCORD_GUILD_ID=...
   token: process.env.DISCORD_BOT_TOKEN ?? '',
   guildId: process.env.DISCORD_GUILD_ID ?? '',
 
@@ -17,21 +14,16 @@ const CONFIG = {
   retryBaseMs: 750,
   indexRetryCapMs: 15_000,
   logRateLimits: true,
-  includeNsfw: true,
+  maxEmojis: null, // null = audit all filtered emojis
 
   // Emoji filters (null = no filter)
   filterAnimated: null,   // true => only animated, false => only static
-  filterAvailable: true,  // true => only available, false => only unavailable
+  filterAvailable: null,  // true => only available, false => only unavailable
   filterManaged: null,    // true => only managed, false => only unmanaged
 
   // Optional allow/deny lists
   onlyEmojiNames: null,   // e.g. ['laugh', 'cry']
   skipEmojiNames: [],
-
-  // Search behavior
-  fetchOldestHit: true,
-  recentWindowsDays: [30, 90],
-  searchTextFromEmojiName: (emojiName) => `:${emojiName}:`,
 
   // Output
   outputDir: './out',
@@ -110,32 +102,50 @@ function snowflakeToDate(snowflake) {
   return new Date(ms);
 }
 
-function dateToSnowflake(date) {
-  const discordEpoch = 1_420_070_400_000n;
-  const d = toDate(date);
-  if (!d) throw new Error('Invalid date passed to dateToSnowflake()');
-  return ((BigInt(d.getTime()) - discordEpoch) << 22n).toString();
-}
-
 function buildMessageUrl(guildId, channelId, messageId) {
   if (!guildId || !channelId || !messageId) return '';
   return `https://discord.com/channels/${guildId}/${channelId}/${messageId}`;
 }
 
-function flattenFirstMessage(messages) {
-  if (!Array.isArray(messages) || messages.length === 0) return null;
-  const firstBucket = messages[0];
-  if (!Array.isArray(firstBucket) || firstBucket.length === 0) return null;
-  return firstBucket[0] ?? null;
+function buildEmojiSearchKeyword(emoji) {
+  const animatedPrefix = emoji.animated ? 'a' : '';
+  return `<${animatedPrefix}:${emoji.name}:${emoji.id}>`;
 }
 
-function buildBaseSearchQuery(emojiName) {
-  return {
-    content: CONFIG.searchTextFromEmojiName(emojiName),
+function buildLatestSearchRoute(emoji) {
+  const params = new URLSearchParams({
+    content: buildEmojiSearchKeyword(emoji),
     sort_by: 'timestamp',
-    include_nsfw: CONFIG.includeNsfw,
-    limit: 1,
-  };
+    sort_order: 'desc',
+    offset: '0',
+  });
+  return `/guilds/${CONFIG.guildId}/messages/search?${params.toString()}`;
+}
+
+function escapeRegex(value) {
+  return String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function messageContainsEmoji(message, emoji) {
+  if (!message?.content) return false;
+  const pattern = new RegExp(`<a?:${escapeRegex(emoji.name)}:${escapeRegex(emoji.id)}>`);
+  return pattern.test(String(message.content));
+}
+
+function findLatestMatchingMessage(messages, emoji) {
+  if (!Array.isArray(messages)) return null;
+
+  for (const bucket of messages) {
+    if (!Array.isArray(bucket)) continue;
+
+    for (const message of bucket) {
+      if (messageContainsEmoji(message, emoji)) {
+        return message;
+      }
+    }
+  }
+
+  return null;
 }
 
 function summarizeMessage(message) {
@@ -176,12 +186,12 @@ function normalizeDiscordError(error) {
   };
 }
 
-async function apiGet(route, query = undefined) {
+async function apiGet(route) {
   let attempt = 0;
 
   while (true) {
     try {
-      const result = await rest.get(route, query ? { query } : undefined);
+      const result = await rest.get(route);
 
       if (
         result &&
@@ -240,29 +250,8 @@ function filterEmojis(emojis) {
   });
 }
 
-async function searchEmojiLatest(emojiName) {
-  const route = `/guilds/${CONFIG.guildId}/messages/search`;
-  return apiGet(route, {
-    ...buildBaseSearchQuery(emojiName),
-    sort_order: 'desc',
-  });
-}
-
-async function searchEmojiOldest(emojiName) {
-  const route = `/guilds/${CONFIG.guildId}/messages/search`;
-  return apiGet(route, {
-    ...buildBaseSearchQuery(emojiName),
-    sort_order: 'asc',
-  });
-}
-
-async function searchEmojiCountSince(emojiName, sinceDate) {
-  const route = `/guilds/${CONFIG.guildId}/messages/search`;
-  return apiGet(route, {
-    ...buildBaseSearchQuery(emojiName),
-    sort_order: 'desc',
-    min_id: dateToSnowflake(sinceDate),
-  });
+async function searchEmojiLatest(emoji) {
+  return apiGet(buildLatestSearchRoute(emoji));
 }
 
 function numberOrZero(value) {
@@ -270,95 +259,36 @@ function numberOrZero(value) {
   return Number.isFinite(n) ? n : 0;
 }
 
-function percent(part, total) {
-  if (!total) return 0;
-  return Number(((part / total) * 100).toFixed(2));
-}
-
 async function auditEmoji(emoji) {
   const createdAt = snowflakeToDate(emoji.id);
-  const latestResponse = await searchEmojiLatest(emoji.name);
-  const latestMessage = flattenFirstMessage(latestResponse.messages);
-  const totalResults = numberOrZero(latestResponse.total_results);
-
-  let oldestMessage = null;
-  if (CONFIG.fetchOldestHit && totalResults > 0) {
-    const oldestResponse = await searchEmojiOldest(emoji.name);
-    oldestMessage = flattenFirstMessage(oldestResponse.messages);
-  }
-
-  const recentCounts = {};
-  if (totalResults > 0) {
-    for (const windowDays of CONFIG.recentWindowsDays) {
-      const since = new Date(Date.now() - windowDays * 86_400_000);
-      const response = await searchEmojiCountSince(emoji.name, since);
-      recentCounts[`count_last_${windowDays}d`] = numberOrZero(response.total_results);
-    }
-  } else {
-    for (const windowDays of CONFIG.recentWindowsDays) {
-      recentCounts[`count_last_${windowDays}d`] = 0;
-    }
-  }
-
+  const latestResponse = await searchEmojiLatest(emoji);
+  const latestMessage = findLatestMatchingMessage(latestResponse.messages, emoji);
+  const totalResults = latestMessage ? numberOrZero(latestResponse.total_results) : 0;
   const latest = summarizeMessage(latestMessage);
-  const oldest = summarizeMessage(oldestMessage);
-
-  const firstUseDate = oldest.timestamp || '';
   const lastUseDate = latest.timestamp || '';
   const emojiAgeDays = daysBetween(createdAt);
-  const firstUseAgeDays = daysBetween(firstUseDate);
   const lastUseAgeDays = daysBetween(lastUseDate);
-  const activeSpanDays = firstUseDate && lastUseDate ? daysBetween(firstUseDate, lastUseDate) : null;
   const daysSinceEmojiCreation = daysBetween(createdAt);
   const usesPer30dSinceCreation = daysSinceEmojiCreation && daysSinceEmojiCreation > 0
     ? Number(((totalResults / daysSinceEmojiCreation) * 30).toFixed(3))
-    : 0;
-  const usesPer30dSinceFirstUse = firstUseAgeDays && firstUseAgeDays > 0
-    ? Number(((totalResults / firstUseAgeDays) * 30).toFixed(3))
     : 0;
 
   const row = {
     emoji_id: String(emoji.id),
     emoji_name: String(emoji.name),
-    emoji_query: CONFIG.searchTextFromEmojiName(emoji.name),
-    emoji_created_at: toIso(createdAt),
-    emoji_age_days: emojiAgeDays ?? '',
+    emoji_query: buildEmojiSearchKeyword(emoji),
     animated: Boolean(emoji.animated),
     available: Boolean(emoji.available),
     managed: Boolean(emoji.managed),
-    require_colons: Boolean(emoji.require_colons),
-    total_results: totalResults,
-    never_used: totalResults === 0,
-    first_used_at: firstUseDate,
-    days_since_first_use: firstUseAgeDays ?? '',
-    oldest_message_id: oldest.messageId,
-    oldest_channel_id: oldest.channelId,
-    oldest_author_id: oldest.authorId,
-    oldest_author_username: oldest.authorUsername,
-    oldest_author_global_name: oldest.authorGlobalName,
-    oldest_message_url: oldest.url,
-    oldest_content_excerpt: oldest.contentExcerpt,
+    emoji_created_at: toIso(createdAt),
+    emoji_age_days: emojiAgeDays ?? '',
     last_used_at: lastUseDate,
     days_since_last_use: lastUseAgeDays ?? '',
-    latest_message_id: latest.messageId,
-    latest_channel_id: latest.channelId,
-    latest_author_id: latest.authorId,
-    latest_author_username: latest.authorUsername,
-    latest_author_global_name: latest.authorGlobalName,
+    total_results: totalResults,
+    uses_per_30d_since_creation: usesPer30dSinceCreation,
     latest_message_url: latest.url,
     latest_content_excerpt: latest.contentExcerpt,
-    active_span_days: activeSpanDays ?? '',
-    uses_per_30d_since_creation: usesPer30dSinceCreation,
-    uses_per_30d_since_first_use: usesPer30dSinceFirstUse,
-    latest_hit_flag: Boolean(latestMessage?.hit),
-    doing_deep_historical_index: Boolean(latestResponse.doing_deep_historical_index),
   };
-
-  for (const windowDays of CONFIG.recentWindowsDays) {
-    const key = `count_last_${windowDays}d`;
-    row[key] = recentCounts[key] ?? 0;
-    row[`pct_last_${windowDays}d`] = percent(row[key], totalResults);
-  }
 
   return row;
 }
@@ -383,8 +313,6 @@ async function mapConcurrent(items, concurrency, mapper) {
 
 function sortRows(rows) {
   return [...rows].sort((a, b) => {
-    if (a.never_used !== b.never_used) return a.never_used ? -1 : 1;
-
     const aDays = a.days_since_last_use === '' ? -1 : Number(a.days_since_last_use);
     const bDays = b.days_since_last_use === '' ? -1 : Number(b.days_since_last_use);
     if (aDays !== bDays) return bDays - aDays;
@@ -392,6 +320,13 @@ function sortRows(rows) {
     if (a.total_results !== b.total_results) return a.total_results - b.total_results;
     return a.emoji_name.localeCompare(b.emoji_name);
   });
+}
+
+function limitItems(items, maxItems) {
+  if (maxItems === null || maxItems === undefined) return items;
+  const limit = Number(maxItems);
+  if (!Number.isFinite(limit) || limit < 0) return items;
+  return items.slice(0, limit);
 }
 
 async function writeCsv(rows, filePath) {
@@ -410,7 +345,6 @@ async function writeJson(rows, filePath) {
 }
 
 function summarizeRun(rows) {
-  const neverUsed = rows.filter((row) => row.never_used).length;
   const available = rows.filter((row) => row.available).length;
   const unavailable = rows.length - available;
   const animated = rows.filter((row) => row.animated).length;
@@ -420,7 +354,6 @@ function summarizeRun(rows) {
   console.log('Summary');
   console.log('-------');
   console.log(`Rows: ${rows.length}`);
-  console.log(`Never used: ${neverUsed}`);
   console.log(`Available: ${available}`);
   console.log(`Unavailable: ${unavailable}`);
   console.log(`Animated: ${animated}`);
@@ -440,7 +373,7 @@ async function main() {
 
   console.log(`Fetching emojis for guild ${CONFIG.guildId}...`);
   const emojis = await getGuildEmojis(CONFIG.guildId);
-  const filteredEmojis = filterEmojis(emojis).slice(0, 3);
+  const filteredEmojis = limitItems(filterEmojis(emojis), CONFIG.maxEmojis);
   console.log(`Fetched ${emojis.length} emoji(s); auditing ${filteredEmojis.length} after filters.`);
 
   const startedAt = Date.now();
