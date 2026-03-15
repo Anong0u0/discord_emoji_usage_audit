@@ -1,67 +1,74 @@
-# Required.
-# Discord guild/server ID to audit.
+# The Discord server to audit.
 guildId: "YOUR_GUILD_ID"
 
-# Number of concurrent search requests.
-# Default: 4
-concurrency: 4
+search:
+  # How many emojis to audit at most.
+  # Use null to include all matching emojis.
+  # Example: 100
+  maxEmojis: null
 
-# Limit how many filtered emojis to audit.
-# Use null to audit all matching emojis.
-# Default: null
-maxEmojis: null
+  # Only count usage on or after this time.
+  # You can fill a snowflake or a normal date/time value.
+  # Examples:
+  # after: "2025-01-01"
+  # after: "2025-01-01T00:00:00Z"
+  # after: "1200000000000000000"
+  after: null
 
-runtime:
-  # Discord REST API version.
-  # Default: "9"
-  apiVersion: "9"
+  # Only count usage on or before this time.
+  # Same format as "after".
+  before: null
 
-  # Retry count for transient HTTP failures.
-  # Default: 6
-  maxRequestRetries: 6
-
-  # Base retry delay in milliseconds.
-  # Default: 750
-  retryBaseMs: 750
-
-  # Max wait for Discord indexing retry in milliseconds.
-  # Default: 15000
-  indexRetryCapMs: 15000
-
-  # Enable Discord rate-limit log output.
-  # Default: true
-  logRateLimits: true
-
-filters:
-  # true  = only animated emojis
+  # true = only animated emojis
   # false = only static emojis
-  # null  = no filter
+  # null = do not filter by animation
   animated: null
 
-  # true  = only available emojis
+  # true = only available emojis
   # false = only unavailable emojis
-  # null  = no filter
+  # null = do not filter by availability
   available: null
 
-  # true  = only managed emojis
+  # true = only managed emojis
   # false = only unmanaged emojis
-  # null  = no filter
+  # null = do not filter by managed state
   managed: null
 
-  # Audit only these emoji names.
-  # Empty array means no allowlist.
+  # Only audit these emoji names.
+  # Leave empty to allow all names.
+  # Example:
+  # onlyEmojiNames: ["pepeLaugh", "catJam"]
   onlyEmojiNames: []
 
   # Skip these emoji names.
-  # Empty array means do not skip any names.
+  # Leave empty to skip none.
+  # Example:
+  # skipEmojiNames: ["deprecated_1", "deprecated_2"]
   skipEmojiNames: []
 
 output:
-  # Output directory for generated files.
-  # Default: "./emoji-usage-output"
-  dir: "./emoji-usage-output"
+  # Where reports will be written.
+  dir: "./output"
 
-format:
-  # Max characters kept for latest message excerpt.
-  # Default: 120
-  excerptLength: 120
+  # Length of the latest message preview in the report.
+  excerptLength: 30
+
+runtime:
+  # How many emojis to process at the same time.
+  # Higher values are faster, but also more aggressive.
+  concurrency: 2
+
+  # Discord API version to use.
+  apiVersion: "9"
+
+  # How many times to retry temporary request failures.
+  maxRequestRetries: 6
+
+  # Starting delay between retries, in milliseconds.
+  retryBaseMs: 750
+
+  # Maximum wait time before retrying a search, in milliseconds.
+  indexRetryCapMs: 15000
+
+  # Show rate-limit related logs.
+  logRateLimits: true

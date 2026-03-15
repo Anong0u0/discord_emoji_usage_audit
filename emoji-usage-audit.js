@@ -5,6 +5,7 @@ import { access, mkdir, readFile, writeFile } from 'node:fs/promises';
 import { constants as fsConstants } from 'node:fs';
 import path from 'node:path';
 import process from 'node:process';
+import { parseArgs } from 'node:util';
 import { parse as parseYaml } from 'yaml';
 
 dotenv.config();
@@ -14,16 +15,10 @@ const DEFAULT_CONFIG_FILENAME = 'emoji-audit.yml';
 
 const DEFAULT_CONFIG = {
   guildId: '',
-  concurrency: 4,
-  maxEmojis: null,
-  runtime: {
-    apiVersion: '9',
-    maxRequestRetries: 6,
-    retryBaseMs: 750,
-    indexRetryCapMs: 15_000,
-    logRateLimits: true,
-  },
-  filters: {
+  search: {
+    maxEmojis: null,
+    after: null,
+    before: null,
     animated: null,
     available: null,
     managed: null,
@@ -31,10 +26,16 @@ const DEFAULT_CONFIG = {
     skipEmojiNames: [],
   },
   output: {
-    dir: './emoji-usage-output',
+    dir: './output',
+    excerptLength: 30,
   },
-  format: {
-    excerptLength: 120,
+  runtime: {
+    concurrency: 2,
+    apiVersion: '9',
+    maxRequestRetries: 6,
+    retryBaseMs: 750,
+    indexRetryCapMs: 15_000,
+    logRateLimits: true,
   },
 };
 
@@ -54,29 +55,21 @@ Environment:
 Options:
   --config <path>            Load a specific YAML config file (default: ./${DEFAULT_CONFIG_FILENAME})
   --guild-id <id>            Override guildId from config (default: config value)
+  --animated <true|false>    true=animated only, false=static only (default: null)
+  --available <true|false>   true=available only, false=unavailable only (default: null)
+  --managed <true|false>     true=managed only, false=unmanaged only (default: null)
+  --only <a,b,c>             Override search.onlyEmojiNames (default: empty)
+  --skip <a,b,c>             Override search.skipEmojiNames (default: empty)
+  --max-emojis <n|null>      Override search.maxEmojis (default: ${DEFAULT_CONFIG.search.maxEmojis})
   --output-dir <path>        Override output.dir (default: ${DEFAULT_CONFIG.output.dir})
-  --concurrency <n>          Override concurrency (default: ${DEFAULT_CONFIG.concurrency})
-  --max-emojis <n|null>      Override maxEmojis (default: ${DEFAULT_CONFIG.maxEmojis})
-  --only <a,b,c>             Override filters.onlyEmojiNames (default: empty)
-  --skip <a,b,c>             Override filters.skipEmojiNames (default: empty)
-  --animated <true|false>    Set filters.animated (default: null)
-  --available <true|false>   Set filters.available (default: null)
-  --managed <true|false>     Set filters.managed (default: null)
-  --excerpt-length <n>       Override format.excerptLength (default: ${DEFAULT_CONFIG.format.excerptLength})
+  --excerpt-length <n>       Override output.excerptLength (default: ${DEFAULT_CONFIG.output.excerptLength})
+  --concurrency <n>          Override runtime.concurrency (default: ${DEFAULT_CONFIG.runtime.concurrency})
   --log-rate-limits <true|false>
                              Set runtime.logRateLimits (default: ${DEFAULT_CONFIG.runtime.logRateLimits})
   Output files are always named report-yymmdd-hhmmss.csv/json.
   --help                     Show this help text
   --version                  Show CLI version
 `;
-
-function printHelp() {
-  console.log(HELP_TEXT);
-}
-
-function printVersion() {
-  console.log(CLI_VERSION);
-}
 
 function isPlainObject(value) {
   return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
@@ -111,7 +104,11 @@ function deepMerge(base, override) {
   return result;
 }
 
-function setNestedValue(target, pathSegments, value) {
+function assignIfDefined(values, inputKey, target, pathSegments, transform = (value) => value) {
+  if (values[inputKey] === undefined) {
+    return;
+  }
+
   let current = target;
 
   for (let index = 0; index < pathSegments.length - 1; index += 1) {
@@ -122,7 +119,7 @@ function setNestedValue(target, pathSegments, value) {
     current = current[segment];
   }
 
-  current[pathSegments[pathSegments.length - 1]] = value;
+  current[pathSegments[pathSegments.length - 1]] = transform(values[inputKey]);
 }
 
 function parseListFlag(value) {
@@ -154,151 +151,66 @@ function parseBooleanFlag(name, value) {
   throw new Error(`Invalid value for ${name}: ${value}. Expected true or false.`);
 }
 
-function consumeFlagValue(args, index, flagName) {
-  const current = args[index];
-  const equalSignIndex = current.indexOf('=');
-  if (equalSignIndex >= 0) {
-    return {
-      value: current.slice(equalSignIndex + 1),
-      nextIndex: index,
-    };
-  }
-
-  const next = args[index + 1];
-  if (next === undefined || next.startsWith('--')) {
-    throw new Error(`Missing value for ${flagName}`);
-  }
-
-  return {
-    value: next,
-    nextIndex: index + 1,
-  };
-}
-
 function parseCliArgs(argv) {
   const overrides = {};
-  let configPath = null;
-  let showHelp = false;
-  let showVersion = false;
+  const { values, positionals } = parseArgs({
+    args: argv,
+    allowPositionals: true,
+    strict: true,
+    options: {
+      help: { type: 'boolean' },
+      version: { type: 'boolean' },
+      config: { type: 'string' },
+      'guild-id': { type: 'string' },
+      'output-dir': { type: 'string' },
+      concurrency: { type: 'string' },
+      'max-emojis': { type: 'string' },
+      only: { type: 'string' },
+      skip: { type: 'string' },
+      animated: { type: 'string' },
+      available: { type: 'string' },
+      managed: { type: 'string' },
+      'excerpt-length': { type: 'string' },
+      'log-rate-limits': { type: 'string' },
+    },
+  });
 
-  for (let index = 0; index < argv.length; index += 1) {
-    const arg = argv[index];
-
-    if (!arg.startsWith('--')) {
-      throw new Error(`Unknown positional argument: ${arg}`);
-    }
-
-    switch (arg.split('=')[0]) {
-      case '--help':
-        showHelp = true;
-        break;
-      case '--version':
-        showVersion = true;
-        break;
-      case '--config': {
-        const consumed = consumeFlagValue(argv, index, '--config');
-        configPath = consumed.value;
-        index = consumed.nextIndex;
-        break;
-      }
-      case '--guild-id': {
-        const consumed = consumeFlagValue(argv, index, '--guild-id');
-        setNestedValue(overrides, ['guildId'], consumed.value);
-        index = consumed.nextIndex;
-        break;
-      }
-      case '--output-dir': {
-        const consumed = consumeFlagValue(argv, index, '--output-dir');
-        setNestedValue(overrides, ['output', 'dir'], consumed.value);
-        index = consumed.nextIndex;
-        break;
-      }
-      case '--concurrency': {
-        const consumed = consumeFlagValue(argv, index, '--concurrency');
-        setNestedValue(
-          overrides,
-          ['concurrency'],
-          parseIntegerFlag('--concurrency', consumed.value, { min: 1 }),
-        );
-        index = consumed.nextIndex;
-        break;
-      }
-      case '--max-emojis': {
-        const consumed = consumeFlagValue(argv, index, '--max-emojis');
-        setNestedValue(
-          overrides,
-          ['maxEmojis'],
-          parseIntegerFlag('--max-emojis', consumed.value, { allowNull: true, min: 0 }),
-        );
-        index = consumed.nextIndex;
-        break;
-      }
-      case '--only': {
-        const consumed = consumeFlagValue(argv, index, '--only');
-        setNestedValue(overrides, ['filters', 'onlyEmojiNames'], parseListFlag(consumed.value));
-        index = consumed.nextIndex;
-        break;
-      }
-      case '--skip': {
-        const consumed = consumeFlagValue(argv, index, '--skip');
-        setNestedValue(overrides, ['filters', 'skipEmojiNames'], parseListFlag(consumed.value));
-        index = consumed.nextIndex;
-        break;
-      }
-      case '--animated': {
-        const consumed = consumeFlagValue(argv, index, '--animated');
-        setNestedValue(overrides, ['filters', 'animated'], parseBooleanFlag('--animated', consumed.value));
-        index = consumed.nextIndex;
-        break;
-      }
-      case '--available': {
-        const consumed = consumeFlagValue(argv, index, '--available');
-        setNestedValue(overrides, ['filters', 'available'], parseBooleanFlag('--available', consumed.value));
-        index = consumed.nextIndex;
-        break;
-      }
-      case '--managed': {
-        const consumed = consumeFlagValue(argv, index, '--managed');
-        setNestedValue(overrides, ['filters', 'managed'], parseBooleanFlag('--managed', consumed.value));
-        index = consumed.nextIndex;
-        break;
-      }
-      case '--excerpt-length': {
-        const consumed = consumeFlagValue(argv, index, '--excerpt-length');
-        setNestedValue(
-          overrides,
-          ['format', 'excerptLength'],
-          parseIntegerFlag('--excerpt-length', consumed.value, { min: 0 }),
-        );
-        index = consumed.nextIndex;
-        break;
-      }
-      case '--log-rate-limits': {
-        const consumed = consumeFlagValue(argv, index, '--log-rate-limits');
-        setNestedValue(overrides, ['runtime', 'logRateLimits'], parseBooleanFlag('--log-rate-limits', consumed.value));
-        index = consumed.nextIndex;
-        break;
-      }
-      default:
-        throw new Error(`Unknown option: ${arg}`);
-    }
+  if (positionals.length > 0) {
+    throw new Error(`Unknown positional argument: ${positionals[0]}`);
   }
+
+  assignIfDefined(values, 'guild-id', overrides, ['guildId']);
+  assignIfDefined(values, 'animated', overrides, ['search', 'animated'], (value) =>
+    parseBooleanFlag('--animated', value),
+  );
+  assignIfDefined(values, 'available', overrides, ['search', 'available'], (value) =>
+    parseBooleanFlag('--available', value),
+  );
+  assignIfDefined(values, 'managed', overrides, ['search', 'managed'], (value) =>
+    parseBooleanFlag('--managed', value),
+  );
+  assignIfDefined(values, 'only', overrides, ['search', 'onlyEmojiNames'], parseListFlag);
+  assignIfDefined(values, 'skip', overrides, ['search', 'skipEmojiNames'], parseListFlag);
+  assignIfDefined(values, 'max-emojis', overrides, ['search', 'maxEmojis'], (value) =>
+    parseIntegerFlag('--max-emojis', value, { allowNull: true, min: 0 }),
+  );
+  assignIfDefined(values, 'output-dir', overrides, ['output', 'dir']);
+  assignIfDefined(values, 'excerpt-length', overrides, ['output', 'excerptLength'], (value) =>
+    parseIntegerFlag('--excerpt-length', value, { min: 0 }),
+  );
+  assignIfDefined(values, 'concurrency', overrides, ['runtime', 'concurrency'], (value) =>
+    parseIntegerFlag('--concurrency', value, { min: 1 }),
+  );
+  assignIfDefined(values, 'log-rate-limits', overrides, ['runtime', 'logRateLimits'], (value) =>
+    parseBooleanFlag('--log-rate-limits', value),
+  );
 
   return {
-    configPath,
+    configPath: values.config ?? null,
     overrides,
-    showHelp,
-    showVersion,
+    showHelp: values.help ?? false,
+    showVersion: values.version ?? false,
   };
-}
-
-async function pathExists(filePath) {
-  try {
-    await access(filePath, fsConstants.F_OK);
-    return true;
-  } catch {
-    return false;
-  }
 }
 
 function resolveConfigPath(cliConfigPath) {
@@ -318,9 +230,9 @@ function resolveConfigPath(cliConfigPath) {
 }
 
 async function loadConfigFile(configLocation) {
-  const exists = await pathExists(configLocation.path);
-
-  if (!exists) {
+  try {
+    await access(configLocation.path, fsConstants.F_OK);
+  } catch {
     if (configLocation.explicit) {
       throw new Error(`Config file not found: ${configLocation.path}`);
     }
@@ -404,24 +316,80 @@ function normalizeStringArray(value, fieldName) {
   });
 }
 
+function dateToSnowflake(date, fieldName) {
+  const discordEpoch = 1_420_070_400_000n;
+  const ms = BigInt(date.getTime());
+
+  if (ms < discordEpoch) {
+    throw new Error(`${fieldName} must be on or after 2015-01-01T00:00:00.000Z`);
+  }
+
+  return ((ms - discordEpoch) << 22n).toString();
+}
+
+function normalizeSnowflakeOrDate(value, fieldName) {
+  if (value === null || value === undefined) {
+    return null;
+  }
+
+  if (typeof value === 'string') {
+    const trimmed = value.trim();
+
+    if (trimmed === '') {
+      return null;
+    }
+
+    if (/^\d+$/.test(trimmed)) {
+      return trimmed;
+    }
+
+    const parsed = new Date(trimmed);
+    if (!Number.isNaN(parsed.getTime())) {
+      return dateToSnowflake(parsed, fieldName);
+    }
+  }
+
+  if (value instanceof Date) {
+    if (Number.isNaN(value.getTime())) {
+      throw new Error(`${fieldName} must be a valid snowflake or Date-compatible value`);
+    }
+    return dateToSnowflake(value, fieldName);
+  }
+
+  if (typeof value === 'number' && Number.isFinite(value)) {
+    return dateToSnowflake(new Date(value), fieldName);
+  }
+
+  throw new Error(`${fieldName} must be a snowflake or Date-compatible value`);
+}
+
 function buildRuntimeConfig(mergedConfig, envConfig) {
+  const searchAfter = normalizeSnowflakeOrDate(mergedConfig.search.after, 'search.after');
+  const searchBefore = normalizeSnowflakeOrDate(mergedConfig.search.before, 'search.before');
+
+  if (searchAfter && searchBefore && BigInt(searchAfter) > BigInt(searchBefore)) {
+    throw new Error('search.after must be <= search.before');
+  }
+
   return {
     token: normalizeOptionalString(envConfig.token, 'DISCORD_BOT_TOKEN'),
     guildId: normalizeOptionalString(mergedConfig.guildId, 'guildId'),
     apiVersion: normalizeString(mergedConfig.runtime.apiVersion, 'runtime.apiVersion'),
-    concurrency: normalizeInteger(mergedConfig.concurrency, 'concurrency', { min: 1 }),
+    concurrency: normalizeInteger(mergedConfig.runtime.concurrency, 'runtime.concurrency', { min: 1 }),
     maxRequestRetries: normalizeInteger(mergedConfig.runtime.maxRequestRetries, 'runtime.maxRequestRetries', { min: 0 }),
     retryBaseMs: normalizeInteger(mergedConfig.runtime.retryBaseMs, 'runtime.retryBaseMs', { min: 0 }),
     indexRetryCapMs: normalizeInteger(mergedConfig.runtime.indexRetryCapMs, 'runtime.indexRetryCapMs', { min: 0 }),
     logRateLimits: normalizeBooleanOrNull(mergedConfig.runtime.logRateLimits, 'runtime.logRateLimits') ?? true,
-    maxEmojis: normalizeIntegerOrNull(mergedConfig.maxEmojis, 'maxEmojis', { min: 0, allowNull: true }),
-    filterAnimated: normalizeBooleanOrNull(mergedConfig.filters.animated, 'filters.animated'),
-    filterAvailable: normalizeBooleanOrNull(mergedConfig.filters.available, 'filters.available'),
-    filterManaged: normalizeBooleanOrNull(mergedConfig.filters.managed, 'filters.managed'),
-    onlyEmojiNames: normalizeStringArray(mergedConfig.filters.onlyEmojiNames, 'filters.onlyEmojiNames'),
-    skipEmojiNames: normalizeStringArray(mergedConfig.filters.skipEmojiNames, 'filters.skipEmojiNames') ?? [],
+    filterAnimated: normalizeBooleanOrNull(mergedConfig.search.animated, 'search.animated'),
+    filterAvailable: normalizeBooleanOrNull(mergedConfig.search.available, 'search.available'),
+    filterManaged: normalizeBooleanOrNull(mergedConfig.search.managed, 'search.managed'),
+    onlyEmojiNames: normalizeStringArray(mergedConfig.search.onlyEmojiNames, 'search.onlyEmojiNames'),
+    skipEmojiNames: normalizeStringArray(mergedConfig.search.skipEmojiNames, 'search.skipEmojiNames') ?? [],
+    searchMaxEmojis: normalizeIntegerOrNull(mergedConfig.search.maxEmojis, 'search.maxEmojis', { min: 0, allowNull: true }),
+    searchAfter,
+    searchBefore,
     outputDir: normalizeString(mergedConfig.output.dir, 'output.dir'),
-    excerptLength: normalizeInteger(mergedConfig.format.excerptLength, 'format.excerptLength', { min: 0 }),
+    excerptLength: normalizeInteger(mergedConfig.output.excerptLength, 'output.excerptLength', { min: 0 }),
   };
 }
 
@@ -429,12 +397,12 @@ async function loadRuntimeConfig(argv) {
   const cli = parseCliArgs(argv);
 
   if (cli.showHelp) {
-    printHelp();
+    console.log(HELP_TEXT);
     process.exit(0);
   }
 
   if (cli.showVersion) {
-    printVersion();
+    console.log(CLI_VERSION);
     process.exit(0);
   }
 
@@ -476,10 +444,6 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-function now() {
-  return new Date();
-}
-
 function toDate(value) {
   if (!value) return null;
   const date = value instanceof Date ? value : new Date(value);
@@ -507,7 +471,7 @@ function excerpt(text, maxLength) {
   return `${normalized.slice(0, maxLength - 1)}...`;
 }
 
-function daysBetween(earlier, later = now()) {
+function daysBetween(earlier, later = new Date()) {
   const a = toDate(earlier);
   const b = toDate(later);
   if (!a || !b) return null;
@@ -531,14 +495,22 @@ function buildEmojiSearchKeyword(emoji) {
   return `<${animatedPrefix}:${emoji.name}:${emoji.id}>`;
 }
 
-function buildLatestSearchRoute(guildId, emoji) {
-  const params = new URLSearchParams({
-    content: buildEmojiSearchKeyword(emoji),
-    sort_by: 'timestamp',
-    sort_order: 'desc',
-    offset: '0',
-  });
-  return `/guilds/${guildId}/messages/search?${params.toString()}`;
+function buildLatestSearchRoute(config, emoji) {
+  const params = new URLSearchParams();
+  params.set('content', buildEmojiSearchKeyword(emoji));
+  params.set('sort_by', 'timestamp');
+  params.set('sort_order', 'desc');
+  params.set('offset', '0');
+
+  if (config.searchAfter) {
+    params.set('min_id', config.searchAfter);
+  }
+
+  if (config.searchBefore) {
+    params.set('max_id', config.searchBefore);
+  }
+
+  return `/guilds/${config.guildId}/messages/search?${params.toString()}`;
 }
 
 function escapeRegex(value) {
@@ -662,20 +634,13 @@ async function getGuildEmojis(rest, config, guildId) {
   return result;
 }
 
-function searchEmojiLatest(rest, config, emoji) {
-  return apiGet(rest, config, buildLatestSearchRoute(config.guildId, emoji));
-}
-
-function numberOrZero(value) {
-  const n = Number(value ?? 0);
-  return Number.isFinite(n) ? n : 0;
-}
-
 async function auditEmoji(rest, config, emoji) {
   const createdAt = snowflakeToDate(emoji.id);
-  const latestResponse = await searchEmojiLatest(rest, config, emoji);
+  const latestResponse = await apiGet(rest, config, buildLatestSearchRoute(config, emoji));
   const latestMessage = findLatestMatchingMessage(latestResponse.messages, emoji);
-  const totalResults = latestMessage ? numberOrZero(latestResponse.total_results) : 0;
+  const totalResults = latestMessage && Number.isFinite(Number(latestResponse.total_results))
+    ? Number(latestResponse.total_results)
+    : 0;
   const latest = summarizeMessage(latestMessage, config);
   const lastUseDate = latest.timestamp || '';
   const emojiAgeDays = daysBetween(createdAt);
@@ -798,8 +763,8 @@ async function main() {
 
   console.log(`Fetching emojis for guild ${config.guildId}...`);
   const emojis = await getGuildEmojis(rest, config, config.guildId);
-  const filteredEmojis = limitItems(filterEmojis(emojis, config), config.maxEmojis);
-  console.log(`Fetched ${emojis.length} emoji(s); auditing ${filteredEmojis.length} after filters.`);
+  const filteredEmojis = limitItems(filterEmojis(emojis, config), config.searchMaxEmojis);
+  console.log(`Fetched ${emojis.length} emoji(s); auditing ${filteredEmojis.length} after search criteria.`);
 
   const startedAt = Date.now();
   let completed = 0;
