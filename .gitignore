@@ -3,9 +3,11 @@ node_modules/*
 .env
 .env.local
 .env.*.local
-emoji-audit.yml
+config.yml
 
 output/*
+dist/*
+release/*
 
 *.log
 npm-debug.log*

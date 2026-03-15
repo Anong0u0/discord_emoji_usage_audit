@@ -11,7 +11,7 @@ import { parse as parseYaml } from 'yaml';
 dotenv.config();
 
 const CLI_VERSION = '1.0.0';
-const DEFAULT_CONFIG_FILENAME = 'emoji-audit.yml';
+const DEFAULT_CONFIG_FILENAME = 'config.yml';
 
 const DEFAULT_CONFIG = {
   guildId: '',
@@ -43,7 +43,7 @@ const HELP_TEXT = `Discord Emoji Usage Audit
 
 Usage:
   emoji-audit [options]
-  node emoji-usage-audit.js [options]
+  node main.js [options]
 
 Default config:
   The CLI will try to read ./${DEFAULT_CONFIG_FILENAME} (default path)
@@ -793,8 +793,33 @@ async function main() {
   console.log(`Elapsed: ${((Date.now() - startedAt) / 1000).toFixed(1)}s`);
 }
 
-main().catch((error) => {
-  console.error('Fatal error');
-  console.error(error.message ?? error);
-  process.exitCode = 1;
-});
+async function waitForExitKeyIfPackaged() {
+  if (globalThis.__EMOJI_AUDIT_PACKAGED__ !== true || !process.stdin.isTTY || !process.stdout.isTTY || typeof process.stdin.setRawMode !== 'function') {
+    return;
+  }
+
+  process.stdout.write('\nPress any key to exit...');
+
+  const wasRawMode = process.stdin.isRaw;
+  process.stdin.setRawMode(true);
+  process.stdin.resume();
+
+  await new Promise((resolve) => {
+    process.stdin.once('data', () => {
+      resolve();
+    });
+  });
+
+  process.stdin.setRawMode(wasRawMode);
+  process.stdin.pause();
+}
+
+main()
+  .catch((error) => {
+    console.error('Fatal error');
+    console.error(error.message ?? error);
+    process.exitCode = 1;
+  })
+  .finally(async () => {
+    await waitForExitKeyIfPackaged();
+  });
