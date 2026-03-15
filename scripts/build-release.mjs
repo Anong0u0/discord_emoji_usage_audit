@@ -70,7 +70,7 @@ try {
     const packageDir = path.join(stagingRoot, packageDirName);
     const binarySource = path.join(distDir, target.binaryName);
     const configTarget = path.join(packageDir, 'config.yml');
-    const envTarget = path.join(packageDir, '.env.example');
+    const envTarget = path.join(packageDir, '.env');
     const archivePath = path.join(
       releaseDir,
       target.id.startsWith('windows')
@@ -90,7 +90,7 @@ try {
         [
           { source: path.join(packageDir, target.binaryName), name: `${packageDirName}/${target.binaryName}` },
           { source: configTarget, name: `${packageDirName}/config.yml` },
-          { source: envTarget, name: `${packageDirName}/.env.example` },
+          { source: envTarget, name: `${packageDirName}/.env` },
         ],
         archivePath,
       );
